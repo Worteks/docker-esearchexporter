@@ -1,0 +1,298 @@
+apiVersion: v1
+kind: Template
+labels:
+  app: esearchexporter
+  template: esearchexporter-jenkins-pipeline
+metadata:
+  annotations:
+    description: ElasticSearch exporter - Jenkinsfile
+      see https://github.com/Worteks/docker-esearchexporter
+    iconClass: icon-openshift
+    openshift.io/display-name: ElasticSearch Exporter CI
+    tags: esearchexporter
+  name: esearchexporter-jenkins-pipeline
+objects:
+- apiVersion: v1
+  kind: BuildConfig
+  metadata:
+    annotations:
+      description: Tests ElasticSearch Exporter images
+    name: esearchexporter-jenkins-pipeline
+  spec:
+    strategy:
+      jenkinsPipelineStrategy:
+        jenkinsfile: |-
+          def frontName    = 'ciesrx'
+          def gitCommitMsg = ''
+          def templateMark = 'esrx-jenkins-ci'
+          def templateSel  = 'jenkins-ci-mark'
+          pipeline {
+              agent {
+                  node { label 'maven' }
+              }
+              options { timeout(time: 130, unit: 'MINUTES') }
+              parameters {
+                  string(defaultValue: 'master', description: 'ElasticSearch Docker Image Tag', name: 'elasticsearchTag')
+                  string(defaultValue: 'master', description: 'ElasticSearch Exporter Docker Image - Source Git Branch', name: 'esearchexporterBranch')
+                  string(defaultValue: 'master', description: 'ElasticSearch Exporter Docker Image - Source Git Hash', name: 'esearchexporterHash')
+                  string(defaultValue: '${GIT_SOURCE_HOST}/Worteks/docker-esearchexporter.git', description: 'ElasticSearch Exporter Docker Image - Source Git Repository', name: 'esearchexporterRepo')
+                  string(defaultValue: '3', description: 'Max Retry', name: 'jobMaxRetry')
+                  string(defaultValue: '1', description: 'Retry Count', name: 'jobRetryCount')
+              }
+              stages {
+                  stage('pre-cleanup') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      echo "Using project: ${openshift.project()}"
+                                      echo "cleaning up previous assets for esearchexporter-${frontName}-${params.esearchexporterHash}"
+                                      openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.esearchexporterHash}" ]).delete()
+                                      openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.esearchexporterHash}" ]).delete()
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('create') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      def namespace = "${openshift.project()}"
+                                      try {
+                                          timeout(10) {
+                                              def cloneProto = "http"
+                                              def created
+                                              def objectsFromTemplate
+                                              def privateRepo = false
+                                              def repoHost = params.esearchexporterRepo.split('/')[0]
+                                              def templatePath = "/tmp/workspace/${namespace}/${namespace}-esearchexporter-jenkins-pipeline/tmpesearchexporter${params.esearchexporterBranch}/openshift"
+                                              sh "git config --global http.sslVerify false"
+                                              sh "rm -fr tmpesearchexporter${params.esearchexporterBranch}; mkdir -p tmpesearchexporter${params.esearchexporterBranch}"
+                                              dir ("tmpesearchexporter${params.esearchexporterBranch}") {
+                                                  try {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          cloneProto = "https"
+                                                          privateRepo = true
+                                                          echo "cloning ${params.esearchexporterRepo} over https, using ${repoHost} token"
+                                                          try { git([ branch: "${params.esearchexporterBranch}", url: "https://${GIT_TOKEN}@${params.esearchexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.esearchexporterRepo}#${params.esearchexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      }
+                                                  } catch(e) {
+                                                      if (privateRepo != true) {
+                                                          echo "caught ${e} - assuming no credentials required"
+                                                          echo "cloning ${params.esearchexporterRepo} over http"
+                                                          try { git([ branch: "${params.esearchexporterBranch}", url: "http://${params.esearchexporterRepo}" ]) }
+                                                          catch(e2) {
+                                                              echo "Failed cloning ${params.esearchexporterRepo}#${params.esearchexporterBranch} - ${e2}"
+                                                              throw e2
+                                                          }
+                                                      } else { throw e }
+                                                  }
+                                                  try {
+                                                      gitCommitMsg = sh(returnStdout: true, script: "git log -n 1").trim()
+                                                  } catch(e) { echo "In non-critical catch block resolving commit message - ${e}" }
+                                              }
+                                              try { sh "test -d ${templatePath}" }
+                                              catch (e) {
+                                                  echo "Could not find ./openshift in ${params.esearchexporterRepo}#${params.esearchexporterBranch}"
+                                                  throw e
+                                              }
+                                              echo "Processing ElasticSearchExporter:${params.esearchexporterHash}, from ${repoHost}, tagging to ${params.esearchexporterBranch}"
+                                              echo "Testing against ElasticSearch:${params.elasticsearchTag}"
+                                              try {
+                                                  echo " == Creating ImageStream =="
+                                                  objectsFromTemplate = openshift.process("-f", "${templatePath}/imagestream.yaml", '-p', "FRONTNAME=wsweet")
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating ImageStream - ${e}" }
+                                              try {
+                                                  echo " == Creating BuildConfigs =="
+                                                  if (privateRepo) {
+                                                      withCredentials([string(credentialsId: "git-${repoHost}", variable: 'GIT_TOKEN')]) {
+                                                          objectsFromTemplate = openshift.process("-f", "${templatePath}/build-with-secret.yaml", '-p', "ELASTICSEARCH_EXPORTER_REPOSITORY_REF=${params.esearchexporterHash}",
+                                                              '-p', "ELASTICSEARCH_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.esearchexporterRepo}", '-p', "FRONTNAME=wsweet", '-p', "GIT_DEPLOYMENT_TOKEN=${GIT_TOKEN}")
+                                                      }
+                                                  } else {
+                                                      objectsFromTemplate = openshift.process("-f", "${templatePath}/build.yaml", '-p', "ELASTICSEARCH_EXPORTER_REPOSITORY_REF=${params.esearchexporterHash}",
+                                                          '-p', "ELASTICSEARCH_EXPORTER_REPOSITORY_URL=${cloneProto}://${params.esearchexporterRepo}", '-p', "FRONTNAME=wsweet")
+                                                  }
+                                                  echo "The template will create ${objectsFromTemplate.size()} objects"
+                                                  for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.esearchexporterHash}" }
+                                                  created = openshift.apply(objectsFromTemplate)
+                                                  created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                              } catch(e) { echo "In non-critical catch block while creating BuildConfigs - ${e}" }
+                                              echo " == Creating Demo =="
+                                              objectsFromTemplate = openshift.process("-f", "${templatePath}/run-ephemeral.yaml", '-p', "ELASTICSEARCH_EXPORTER_IMAGE_TAG=${params.esearchexporterHash}",
+                                                  '-p', "ELASTICSEARCH_IMAGESTREAM_TAG=elasticsearch-wsweet:${params.elasticsearchTag}", '-p', "FRONTNAME=${frontName}-${params.esearchexporterHash}")
+                                              echo "The template will create ${objectsFromTemplate.size()} objects"
+                                              for (o in objectsFromTemplate) { o.metadata.labels["${templateSel}"] = "${templateMark}-${params.esearchexporterHash}" }
+                                              created = openshift.create(objectsFromTemplate)
+                                              created.withEach { echo "Created ${it.name()} from template with labels ${it.object().metadata.labels}" }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while creating resources - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('build') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(90) {
+                                              echo "watching esearchexporter-wsweet-${params.esearchexporterHash} docker image build"
+                                              def builds = openshift.selector("bc", [ name: "esearchexporter-wsweet-${params.esearchexporterHash}" ]).related('builds')
+                                              builds.untilEach(1) { return (it.object().status.phase == "Complete") }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while building Docker image - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('deploy') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(5) {
+                                              def namespace = "${openshift.project()}"
+                                              try {
+                                                  sh """
+                                                  oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                  oc describe -n ${namespace} imagestreamtag esearchexporter-wsweet:${params.esearchexporterHash} || exit 1
+                                                  """
+                                              } catch(e) {
+                                                  echo "In catch block while looking for ElasticSearch Exporter image - ${e}"
+                                                  throw e
+                                              }
+                                              retry(2) {
+                                                  echo "watching elasticsearch-${frontName}-${params.esearchexporterHash} deployment rollout"
+                                                  def dc = openshift.selector("dc", [ name: "elasticsearch-${frontName}-${params.esearchexporterHash}" ]).related('pods')
+                                                  dc.untilEach(1) { return (it.object().status.phase == "Running") }
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while deploying - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('check') {
+                      steps {
+                          script {
+                              openshift.withCluster() {
+                                  openshift.withProject() {
+                                      try {
+                                          timeout(15) {
+                                              echo "waiting an additional 7 minutes for application to finish starting up"
+                                              sleep 420
+                                              def namespace = "${openshift.project()}"
+                                              retry(3) {
+                                                  try {
+                                                      def response = httpRequest ignoreSslErrors: true, url: "http://esearchexporter-${frontName}-${params.esearchexporterHash}.${namespace}.svc:9113", timeout: 30, httpMode: 'GET'
+                                                      println("GET prometheus root status: " + response.status)
+                                                      println("GET prometheus root content: " + response.content)
+                                                  } catch(e) { echo "caught ${e}" }
+                                                  response = httpRequest ignoreSslErrors: true, url: "http://esearchexporter-${frontName}-${params.esearchexporterHash}.${namespace}.svc:9113/metrics", timeout: 30, httpMode: 'GET'
+                                                  println("GET prometheus metric status: " + response.status)
+                                                  println("GET prometheus metric content: " + response.content)
+                                              }
+                                          }
+                                      } catch(e) {
+                                          echo "In catch block while checking ElasticSearch Exporter - ${e}"
+                                          throw e
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  stage('tag') {
+                      steps {
+                          script {
+                              if ("${params.esearchexporterBranch}" == "${params.esearchexporterHash}") { echo "skipping tag - source matches target" }
+                              else {
+                                  openshift.withCluster() {
+                                      openshift.withProject() {
+                                          try {
+                                              timeout(5) {
+                                                  def namespace = "${openshift.project()}"
+                                                  retry(3) {
+                                                      sh """
+                                                      oc login https://kubernetes.default.svc.cluster.local --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt --token=\$(cat /var/run/secrets/kubernetes.io/serviceaccount/token) > /dev/null 2>&1
+                                                      oc tag -n ${namespace} esearchexporter-wsweet:${params.esearchexporterHash} esearchexporter-wsweet:${params.esearchexporterBranch}
+                                                      """
+                                                  }
+                                              }
+                                          } catch(e) {
+                                              echo "In catch block while tagging ElasticSearch Exporter image - ${e}"
+                                              throw e
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              post {
+                  always {
+                      script {
+                          openshift.withCluster() {
+                              openshift.withProject() {
+                                  def namespace   = "${openshift.project()}"
+                                  def postJobName = "${namespace}/${namespace}-post-triggers-jenkins-pipeline"
+                                  currentBuild.description = """
+                                  ${params.esearchexporterRepo} ${params.esearchexporterBranch} (try ${params.jobRetryCount}/${params.jobMaxRetry})
+                                  ${gitCommitMsg}
+                                  """.stripIndent()
+                                  echo "cleaning up assets for elasticsearch-wsweet-${params.esearchexporterHash}"
+                                  sh "rm -fr /tmp/workspace/${namespace}/${namespace}-esearchexporter-jenkins-pipeline/tmpesearchexporter${params.esearchexporterBranch}"
+                                  openshift.selector("all", [ "${templateSel}": "${templateMark}-${params.esearchexporterHash}" ]).delete()
+                                  openshift.selector("secrets", [ "${templateSel}": "${templateMark}-${params.esearchexporterHash}" ]).delete()
+                                  def jobParams = [
+                                          [$class: 'StringParameterValue', name: "jobMaxRetry", value: params.jobMaxRetry],
+                                          [$class: 'StringParameterValue', name: "jobRetryCount", value: params.jobRetryCount],
+                                          [$class: 'StringParameterValue', name: "jobStatus", value: currentBuild.currentResult],
+                                          [$class: 'StringParameterValue', name: "sourceBranch", value: params.esearchexporterBranch],
+                                          [$class: 'StringParameterValue', name: "sourceComponent", value: "esearchexporter"],
+                                          [$class: 'StringParameterValue', name: "sourceRef", value: params.esearchexporterHash],
+                                          [$class: 'StringParameterValue', name: "sourceRepo", value: params.esearchexporterRepo]
+                                      ]
+                                  try { build job: postJobName, parameters: jobParams, propagate: false, wait: false }
+                                  catch(e) { echo "caught ${e} starting Job post-process" }
+                              }
+                          }
+                      }
+                  }
+                  changed { echo "changed?" }
+                  failure { echo "Build failed (${params.jobRetryCount} out of ${params.jobMaxRetry})" }
+                  success { echo "success!" }
+                  unstable { echo "unstable?" }
+              }
+          }
+      type: JenkinsPipeline
+parameters:
+- name: GIT_SOURCE_HOST
+  description: Git FQDN we would build images from
+  displayName: Git
+  value: git.worteks.com
